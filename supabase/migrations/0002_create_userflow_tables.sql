@@ -21,7 +21,8 @@ COMMENT ON TABLE public.users IS '사용자 테이블 - 학습자와 강사 정�
 CREATE TABLE IF NOT EXISTS public.terms_agreements (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
-  agreed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  agreed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(user_id)
 );
 
 COMMENT ON TABLE public.terms_agreements IS '약관 동의 이력 테이블';
@@ -47,6 +48,7 @@ CREATE TABLE IF NOT EXISTS public.enrollments (
   user_id UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
   course_id UUID NOT NULL REFERENCES public.courses(id) ON DELETE CASCADE,
   enrolled_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE(user_id, course_id)
 );
 
@@ -94,6 +96,7 @@ CREATE TABLE IF NOT EXISTS public.course_grades (
   course_id UUID NOT NULL REFERENCES public.courses(id) ON DELETE CASCADE,
   total_score DECIMAL(5,2),
   calculated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE(user_id, course_id)
 );
 
@@ -121,6 +124,70 @@ BEGIN
 END;
 $$ language 'plpgsql';
 
+-- Create function for automatic grade calculation
+CREATE OR REPLACE FUNCTION calculate_course_grades()
+RETURNS TRIGGER AS $$
+DECLARE
+  course_record RECORD;
+  student_record RECORD;
+  total_weight DECIMAL(5,2);
+  weighted_score DECIMAL(5,2);
+  final_score DECIMAL(5,2);
+BEGIN
+  -- Only proceed if submission is marked as graded
+  IF NEW.status = 'graded' AND OLD.status != 'graded' THEN
+    -- Check if this is the last assignment to be graded for this course
+    SELECT c.* INTO course_record
+    FROM public.courses c
+    WHERE c.id = (SELECT course_id FROM public.assignments WHERE id = NEW.assignment_id);
+
+    -- For each student enrolled in this course
+    FOR student_record IN
+      SELECT DISTINCT e.user_id
+      FROM public.enrollments e
+      WHERE e.course_id = course_record.id
+    LOOP
+      -- Calculate total weighted score for this student
+      SELECT
+        COALESCE(SUM(
+          CASE
+            WHEN s.score IS NOT NULL THEN
+              s.score * (a.points_weight / 100.0)
+            ELSE 0
+          END
+        ), 0) INTO weighted_score
+      FROM public.submissions s
+      JOIN public.assignments a ON s.assignment_id = a.id
+      WHERE s.user_id = student_record.user_id
+        AND a.course_id = course_record.id
+        AND s.status = 'graded';
+
+      -- Get total weight of all assignments in the course
+      SELECT COALESCE(SUM(points_weight), 0) INTO total_weight
+      FROM public.assignments
+      WHERE course_id = course_record.id;
+
+      -- Calculate final score (percentage)
+      IF total_weight > 0 THEN
+        final_score := (weighted_score / total_weight) * 100;
+      ELSE
+        final_score := 0;
+      END IF;
+
+      -- Update or insert course grade
+      INSERT INTO public.course_grades (user_id, course_id, total_score, calculated_at)
+      VALUES (student_record.user_id, course_record.id, final_score, NOW())
+      ON CONFLICT (user_id, course_id)
+      DO UPDATE SET
+        total_score = final_score,
+        calculated_at = NOW();
+    END LOOP;
+  END IF;
+
+  RETURN NEW;
+END;
+$$ language 'plpgsql';
+
 -- Create triggers for updated_at
 CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON public.users
   FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
@@ -130,6 +197,23 @@ CREATE TRIGGER update_courses_updated_at BEFORE UPDATE ON public.courses
 
 CREATE TRIGGER update_assignments_updated_at BEFORE UPDATE ON public.assignments
   FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_terms_agreements_updated_at BEFORE UPDATE ON public.terms_agreements
+  FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_enrollments_updated_at BEFORE UPDATE ON public.enrollments
+  FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_submissions_updated_at BEFORE UPDATE ON public.submissions
+  FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_course_grades_updated_at BEFORE UPDATE ON public.course_grades
+  FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- Create trigger for automatic grade calculation when submissions are graded
+CREATE TRIGGER trigger_calculate_course_grades
+  AFTER UPDATE ON public.submissions
+  FOR EACH ROW EXECUTE FUNCTION calculate_course_grades();
 
 -- Disable Row Level Security as per guidelines
 ALTER TABLE IF EXISTS public.users DISABLE ROW LEVEL SECURITY;
