@@ -6,11 +6,18 @@ import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { getSupabaseBrowserClient } from "@/lib/supabase/browser-client";
 import { useCurrentUser } from "@/features/auth/hooks/useCurrentUser";
+import { UserRole, SignupRequest } from "@/features/auth/types";
+import { apiClient } from "@/lib/remote/api-client";
+import { getRoleBasedRedirectPath } from "@/features/auth/lib/role-redirect";
 
 const defaultFormState = {
   email: "",
   password: "",
   confirmPassword: "",
+  role: "learner" as UserRole,
+  name: "",
+  phoneNumber: "",
+  agreeToTerms: false,
 };
 
 type SignupPageProps = {
@@ -26,6 +33,7 @@ export default function SignupPage({ params }: SignupPageProps) {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [infoMessage, setInfoMessage] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
 
   useEffect(() => {
     if (isAuthenticated) {
@@ -34,12 +42,43 @@ export default function SignupPage({ params }: SignupPageProps) {
     }
   }, [isAuthenticated, router, searchParams]);
 
+  // 휴대폰번호 형식 검증 함수
+  const validatePhoneNumber = useCallback((phoneNumber: string): boolean => {
+    const phoneRegex = /^010-\d{4}-\d{4}$/;
+    return phoneRegex.test(phoneNumber);
+  }, []);
+
+  // 폼 검증 함수
+  const validateForm = useCallback(() => {
+    const errors: Record<string, string> = {};
+
+    if (!formState.name.trim()) {
+      errors.name = "이름을 입력해주세요";
+    }
+
+    if (!formState.phoneNumber.trim()) {
+      errors.phoneNumber = "휴대폰번호를 입력해주세요";
+    } else if (!validatePhoneNumber(formState.phoneNumber)) {
+      errors.phoneNumber = "올바른 휴대폰번호 형식이 아닙니다 (010-XXXX-XXXX)";
+    }
+
+    if (!formState.agreeToTerms) {
+      errors.agreeToTerms = "약관에 동의해야 합니다";
+    }
+
+    setFieldErrors(errors);
+    return Object.keys(errors).length === 0;
+  }, [formState.name, formState.phoneNumber, formState.agreeToTerms, validatePhoneNumber]);
+
   const isSubmitDisabled = useMemo(
     () =>
       !formState.email.trim() ||
       !formState.password.trim() ||
-      formState.password !== formState.confirmPassword,
-    [formState.confirmPassword, formState.email, formState.password]
+      formState.password !== formState.confirmPassword ||
+      !formState.name.trim() ||
+      !formState.phoneNumber.trim() ||
+      !formState.agreeToTerms,
+    [formState.confirmPassword, formState.email, formState.password, formState.name, formState.phoneNumber, formState.agreeToTerms]
   );
 
   const handleChange = useCallback(
@@ -56,48 +95,55 @@ export default function SignupPage({ params }: SignupPageProps) {
       setIsSubmitting(true);
       setErrorMessage(null);
       setInfoMessage(null);
+      setFieldErrors({});
 
-      if (formState.password !== formState.confirmPassword) {
-        setErrorMessage("비밀번호가 일치하지 않습니다.");
+      // 클라이언트 측 검증
+      if (!validateForm()) {
         setIsSubmitting(false);
         return;
       }
 
-      const supabase = getSupabaseBrowserClient();
-
       try {
-        const result = await supabase.auth.signUp({
+        // 회원가입 요청 데이터 준비
+        const signupData: SignupRequest = {
           email: formState.email,
           password: formState.password,
+          role: formState.role,
+          name: formState.name,
+          phoneNumber: formState.phoneNumber,
+          agreeToTerms: formState.agreeToTerms,
+        };
+
+        // 새로운 회원가입 API 호출
+        const response = await apiClient.POST("/auth/signup", {
+          body: signupData,
         });
 
-        if (result.error) {
-          setErrorMessage(result.error.message ?? "회원가입에 실패했습니다.");
+        if (!response.ok) {
+          setErrorMessage(response.error?.message ?? "회원가입에 실패했습니다.");
           setIsSubmitting(false);
           return;
         }
 
+        // 회원가입 성공 처리
         await refresh();
-
-        const redirectedFrom = searchParams.get("redirectedFrom") ?? "/";
-
-        if (result.data.session) {
-          router.replace(redirectedFrom);
-          return;
-        }
-
-        setInfoMessage(
-          "확인 이메일을 보냈습니다. 이메일 인증 후 로그인해 주세요."
-        );
-        router.prefetch("/login");
+        const redirectPath = getRoleBasedRedirectPath(formState.role);
+        setInfoMessage(`회원가입이 완료되었습니다. 로그인 후 ${formState.role === 'learner' ? '코스 카탈로그' : '강사 대시보드'}로 이동합니다.`);
         setFormState(defaultFormState);
+
+        // 잠시 후 로그인 페이지로 이동
+        setTimeout(() => {
+          router.push("/login");
+        }, 2000);
+
       } catch (error) {
+        console.error("Signup error:", error);
         setErrorMessage("회원가입 처리 중 문제가 발생했습니다.");
       } finally {
         setIsSubmitting(false);
       }
     },
-    [formState.confirmPassword, formState.email, formState.password, refresh, router, searchParams]
+    [formState, validateForm, refresh, router]
   );
 
   if (isAuthenticated) {
@@ -153,6 +199,89 @@ export default function SignupPage({ params }: SignupPageProps) {
               className="rounded-md border border-slate-300 px-3 py-2 focus:border-slate-500 focus:outline-none"
             />
           </label>
+
+          {/* 역할 선택 */}
+          <fieldset className="flex flex-col gap-2">
+            <legend className="text-sm text-slate-700">역할 선택</legend>
+            <div className="flex gap-4">
+              <label className="flex items-center gap-2 text-sm text-slate-700">
+                <input
+                  type="radio"
+                  name="role"
+                  value="learner"
+                  checked={formState.role === "learner"}
+                  onChange={handleChange}
+                  className="text-slate-900 focus:ring-slate-500"
+                />
+                학습자
+              </label>
+              <label className="flex items-center gap-2 text-sm text-slate-700">
+                <input
+                  type="radio"
+                  name="role"
+                  value="instructor"
+                  checked={formState.role === "instructor"}
+                  onChange={handleChange}
+                  className="text-slate-900 focus:ring-slate-500"
+                />
+                강사
+              </label>
+            </div>
+          </fieldset>
+
+          <label className="flex flex-col gap-2 text-sm text-slate-700">
+            이름
+            <input
+              type="text"
+              name="name"
+              autoComplete="name"
+              required
+              value={formState.name}
+              onChange={handleChange}
+              className="rounded-md border border-slate-300 px-3 py-2 focus:border-slate-500 focus:outline-none"
+            />
+            {fieldErrors.name && (
+              <p className="text-xs text-rose-500">{fieldErrors.name}</p>
+            )}
+          </label>
+
+          <label className="flex flex-col gap-2 text-sm text-slate-700">
+            휴대폰번호
+            <input
+              type="tel"
+              name="phoneNumber"
+              autoComplete="tel"
+              required
+              placeholder="010-1234-5678"
+              value={formState.phoneNumber}
+              onChange={handleChange}
+              className="rounded-md border border-slate-300 px-3 py-2 focus:border-slate-500 focus:outline-none"
+            />
+            {fieldErrors.phoneNumber && (
+              <p className="text-xs text-rose-500">{fieldErrors.phoneNumber}</p>
+            )}
+          </label>
+
+          {/* 약관 동의 */}
+          <label className="flex items-start gap-2 text-sm text-slate-700">
+            <input
+              type="checkbox"
+              name="agreeToTerms"
+              checked={formState.agreeToTerms}
+              onChange={(e) => setFormState(prev => ({ ...prev, agreeToTerms: e.target.checked }))}
+              className="mt-0.5 text-slate-900 focus:ring-slate-500"
+            />
+            <span>
+              <Link href="/terms" className="text-slate-900 underline hover:text-slate-700">
+                이용약관
+              </Link>
+              에 동의합니다
+            </span>
+          </label>
+          {fieldErrors.agreeToTerms && (
+            <p className="text-xs text-rose-500">{fieldErrors.agreeToTerms}</p>
+          )}
+
           {errorMessage ? (
             <p className="text-sm text-rose-500">{errorMessage}</p>
           ) : null}
